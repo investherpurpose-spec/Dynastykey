@@ -1,0 +1,2 @@
+requests>=2.31
+anthropic>=0.60  # only needed for the optional claude-match command

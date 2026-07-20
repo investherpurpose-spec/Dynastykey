@@ -225,6 +225,152 @@ def test_point_of_malformed_does_not_raise():
 
 # ---- iter_features uses resolver + paging (fully faked) --------------------
 
+class DetServer:
+    """Deterministic fake ArcGIS layer backed by a sorted OBJECTID list.
+
+    Honors resultOffset/resultRecordCount against the ordered list and records
+    every query's params so tests can assert orderByFields was sent.
+    """
+    def __init__(self, info, oids):
+        self.info = info
+        self.oids = list(oids)
+        self.query_params = []
+
+    def get(self, url, params=None, timeout=None):
+        params = params or {}
+        if url.endswith("/query"):
+            self.query_params.append(dict(params))
+            if params.get("returnCountOnly"):
+                return FakeResp({"count": len(self.oids)})
+            if params.get("returnIdsOnly"):
+                return FakeResp({"objectIds": list(self.oids)})
+            if params.get("objectIds"):  # objectId-chunk fallback path
+                ids = [int(x) for x in str(params["objectIds"]).split(",")]
+                feats = [{"attributes": {"OBJECTID": i}} for i in ids]
+                return FakeResp({"features": feats})
+            off = int(params.get("resultOffset", 0))
+            cnt = int(params.get("resultRecordCount", len(self.oids)))
+            window = self.oids[off:off + cnt]
+            feats = [{"attributes": {"OBJECTID": i}} for i in window]
+            exceeded = (off + cnt) < len(self.oids)
+            return FakeResp({"features": feats, "exceededTransferLimit": exceeded})
+        return FakeResp(self.info)  # layer metadata (resolve_layer)
+
+
+def _paged_layer_info(**over):
+    info = {
+        "fields": [{"name": "OBJECTID", "type": "esriFieldTypeOID"}],
+        "type": "Feature Layer",
+        "maxRecordCount": 2,
+        "advancedQueryCapabilities": {"supportsPagination": True},
+        "objectIdField": "OBJECTID",
+    }
+    info.update(over)
+    return info
+
+
+# ---- deterministic ordered paging -----------------------------------------
+
+def test_paging_metadata_order_field():
+    plan = arcgis.paging_metadata(_paged_layer_info())
+    assert plan["order_by_field"] == "OBJECTID"
+    assert plan["order_by"] == "OBJECTID ASC"
+    assert plan["supports_pagination"] is True
+
+
+def test_pagination_sends_orderby(monkeypatch):
+    monkeypatch.setattr(arcgis.time, "sleep", lambda *_: None)
+    server = DetServer(_paged_layer_info(), oids=[1, 2, 3, 4, 5])
+    monkeypatch.setattr(arcgis, "_session", lambda: server)
+
+    feats = list(arcgis.iter_features("http://layer/0"))
+    assert [f["attributes"]["OBJECTID"] for f in feats] == [1, 2, 3, 4, 5]
+    # every paged query carried a stable ascending order on the OID field
+    paged = [p for p in server.query_params
+             if "resultOffset" in p and "returnCountOnly" not in p]
+    assert paged and all(p.get("orderByFields") == "OBJECTID ASC" for p in paged)
+
+
+def test_paging_is_deterministic_across_calls(monkeypatch):
+    monkeypatch.setattr(arcgis.time, "sleep", lambda *_: None)
+    oids = list(range(1, 8))
+    monkeypatch.setattr(arcgis, "_session", lambda: DetServer(_paged_layer_info(), oids))
+    first = [f["attributes"]["OBJECTID"] for f in arcgis.iter_features("http://layer/0")]
+    monkeypatch.setattr(arcgis, "_session", lambda: DetServer(_paged_layer_info(), oids))
+    second = [f["attributes"]["OBJECTID"] for f in arcgis.iter_features("http://layer/0")]
+    assert first == second == oids  # same order every time
+
+
+# ---- resume from a checkpoint: no gaps, no duplicates ---------------------
+
+def test_resume_from_offset_no_gaps_no_dupes(monkeypatch):
+    monkeypatch.setattr(arcgis.time, "sleep", lambda *_: None)
+    oids = list(range(1, 8))  # 7 features
+
+    # simulate an interruption after 3 features, then resume from offset 3
+    monkeypatch.setattr(arcgis, "_session", lambda: DetServer(_paged_layer_info(), oids))
+    first_part = [f["attributes"]["OBJECTID"]
+                  for f in arcgis.iter_features("http://layer/0", limit=3)]
+    assert first_part == [1, 2, 3]
+
+    monkeypatch.setattr(arcgis, "_session", lambda: DetServer(_paged_layer_info(), oids))
+    resumed = [f["attributes"]["OBJECTID"]
+               for f in arcgis.iter_features("http://layer/0", start_offset=3)]
+
+    combined = first_part + resumed
+    assert combined == oids            # no gaps
+    assert len(combined) == len(set(combined))  # no duplicates
+
+
+def test_resume_offset_sends_orderby(monkeypatch):
+    monkeypatch.setattr(arcgis.time, "sleep", lambda *_: None)
+    server = DetServer(_paged_layer_info(), oids=list(range(1, 6)))
+    monkeypatch.setattr(arcgis, "_session", lambda: server)
+    list(arcgis.iter_features("http://layer/0", start_offset=2))
+    paged = [p for p in server.query_params if "resultOffset" in p]
+    assert paged[0]["resultOffset"] == 2
+    assert all(p.get("orderByFields") == "OBJECTID ASC" for p in paged)
+
+
+# ---- fail loud when no stable ordering field exists -----------------------
+
+def test_paging_metadata_raises_without_oid():
+    info = {"type": "Feature Layer", "fields": [{"name": "NAME", "type": "esriFieldTypeString"}],
+            "advancedQueryCapabilities": {"supportsPagination": True}}
+    with pytest.raises(arcgis.ArcGISError):
+        arcgis.paging_metadata(info)
+
+
+def test_paging_metadata_raises_when_orderby_unsupported():
+    info = _paged_layer_info(
+        advancedQueryCapabilities={"supportsPagination": True, "supportsOrderBy": False})
+    with pytest.raises(arcgis.ArcGISError):
+        arcgis.paging_metadata(info)
+
+
+def test_iter_features_raises_when_no_stable_order(monkeypatch):
+    monkeypatch.setattr(arcgis.time, "sleep", lambda *_: None)
+    bad_info = {"type": "Feature Layer",
+                "fields": [{"name": "NAME", "type": "esriFieldTypeString"}],
+                "maxRecordCount": 2,
+                "advancedQueryCapabilities": {"supportsPagination": True}}
+    monkeypatch.setattr(arcgis, "_session", lambda: DetServer(bad_info, oids=[1, 2, 3]))
+    with pytest.raises(arcgis.ArcGISError):
+        list(arcgis.iter_features("http://layer/0"))
+
+
+def test_non_paginated_fallback_still_deterministic(monkeypatch):
+    # no pagination -> objectId-chunk fallback, which sorts ids ascending
+    monkeypatch.setattr(arcgis.time, "sleep", lambda *_: None)
+    info = {"type": "Feature Layer",
+            "fields": [{"name": "OBJECTID", "type": "esriFieldTypeOID"}],
+            "maxRecordCount": 2, "objectIdField": "OBJECTID",
+            "advancedQueryCapabilities": {"supportsPagination": False}}
+    monkeypatch.setattr(arcgis, "_session", lambda: DetServer(info, oids=[5, 3, 1, 4, 2]))
+    feats = list(arcgis.iter_features("http://layer/0"))
+    assert [f["attributes"]["OBJECTID"] for f in feats] == [1, 2, 3, 4, 5]  # sorted
+
+
 def test_iter_features_paginates_and_resolves(monkeypatch):
     monkeypatch.setattr(arcgis.time, "sleep", lambda *_: None)
     layer_info = {

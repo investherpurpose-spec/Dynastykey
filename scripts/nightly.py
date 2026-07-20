@@ -302,6 +302,9 @@ def _stage_gis(ctx: NightlyContext) -> StageOutcome:
 
     resolved, info = arcgis.resolve_layer(layer)
     fields = info.get("fields") or []
+    # Deterministic-paging plan (fails loud if paging can't be ordered stably);
+    # preserved in the manifest as source metadata.
+    plan = arcgis.paging_metadata(info)
 
     # expected count for reconciliation: the layer's count, capped by any limit.
     expected = None
@@ -321,8 +324,18 @@ def _stage_gis(ctx: NightlyContext) -> StageOutcome:
         layer_url=resolved, expected_count=expected,
         resume=ctx.params.get("resume", False),
         reconcile_tolerance=ctx.params.get("gis_reconcile_tolerance", 0.02))
-    return StageOutcome(rows=total,
-                        detail=f"parcels layer -> {table} (staged+promoted)")
+    return StageOutcome(
+        rows=total,
+        detail=f"parcels layer -> {table} (staged+promoted, "
+               f"order_by={plan['order_by']})",
+        data={"source_metadata": {
+            "layer_url": resolved,
+            "object_id_field": plan["order_by_field"],
+            "order_by": plan["order_by"],
+            "supports_pagination": plan["supports_pagination"],
+            "advertised_count": expected,
+            "loaded_count": total,
+        }})
 
 
 def _stage_identity(ctx: NightlyContext) -> StageOutcome:

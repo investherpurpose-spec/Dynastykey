@@ -167,6 +167,47 @@ def reconcile_count(expected: Optional[int], got: int,
     return ok, f"got {got} vs expected {expected} (delta {delta:.4f}, allow {tolerance})"
 
 
+def stable_order_field(info: dict) -> Optional[str]:
+    """The field to sort by for deterministic paging: the layer's objectIdField
+    (or, failing that, the OID-typed field). None if none can be established."""
+    oid = info.get("objectIdField")
+    if oid:
+        return oid
+    for f in info.get("fields") or []:
+        if f.get("type") == "esriFieldTypeOID":
+            return f.get("name")
+    return None
+
+
+def paging_metadata(info: dict) -> dict:
+    """Deterministic-paging plan for a layer.
+
+    `resultOffset` paging is only stable if the server returns rows in a
+    guaranteed order, so we always page with `orderByFields=<objectIdField> ASC`.
+    If a layer advertises pagination but no stable ordering field can be
+    established (no objectIdField / OID field, or the layer reports it does not
+    support orderBy), we FAIL LOUD rather than page non-deterministically.
+    """
+    adv = info.get("advancedQueryCapabilities") or {}
+    supports_pagination = bool(adv.get("supportsPagination"))
+    order_field = stable_order_field(info)
+    # Default True when the capability key is absent — servers that paginate
+    # effectively always support orderBy; only an explicit False blocks us.
+    supports_order_by = adv.get("supportsOrderBy", True)
+    if supports_pagination and (not order_field or not supports_order_by):
+        raise ArcGISError(
+            "layer advertises pagination but no stable ordering field can be "
+            f"established (order_field={order_field!r}, "
+            f"supportsOrderBy={supports_order_by}); refusing non-deterministic paging")
+    return {
+        "supports_pagination": supports_pagination,
+        "order_by_field": order_field,
+        "order_by": f"{order_field} ASC" if order_field else None,
+        "supports_order_by": bool(supports_order_by),
+        "max_record_count": int(info.get("maxRecordCount") or DEFAULT_PAGE_SIZE),
+    }
+
+
 def in_bbox(lon, lat, bbox: tuple = HARRIS_BBOX) -> bool:
     """True if (lon, lat) is inside bbox and numeric."""
     try:
@@ -210,15 +251,11 @@ def iter_features(
     # (e.g. the MapServer mirror) instead of aborting the pull.
     layer_url, info = resolve_layer(layer_url, session=session)
 
-    max_rc = int(info.get("maxRecordCount") or DEFAULT_PAGE_SIZE)
-    page = min(page_size or max_rc, max_rc)
-    adv = info.get("advancedQueryCapabilities") or {}
-    supports_pagination = bool(adv.get("supportsPagination"))
-    oid_field = info.get("objectIdField") or "OBJECTID"
-    for f in info.get("fields") or []:
-        if f.get("type") == "esriFieldTypeOID":
-            oid_field = f["name"]
-            break
+    # Deterministic-paging plan — raises loud if pagination is advertised but
+    # no stable ordering field can be established.
+    plan = paging_metadata(info)
+    page = min(page_size or plan["max_record_count"], plan["max_record_count"])
+    supports_pagination = plan["supports_pagination"]
 
     query_url = layer_url + "/query"
     base = {
@@ -231,9 +268,13 @@ def iter_features(
 
     yielded = 0
     if supports_pagination:
+        # Guaranteed present (paging_metadata would have raised otherwise): sort
+        # by the objectId field so resultOffset paging is stable and resumable.
+        order_by = plan["order_by"]
         offset = start_offset
         while True:
-            params = dict(base, resultOffset=offset, resultRecordCount=page)
+            params = dict(base, resultOffset=offset, resultRecordCount=page,
+                          orderByFields=order_by)
             data = _get_json(session, query_url, params)
             feats = data.get("features") or []
             if not feats:

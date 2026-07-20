@@ -60,7 +60,11 @@ spine). No external dependencies. This is the milestone that proves the pipeline
     geospatial sanity (`HARRIS_BBOX`, `in_bbox`, `validate_point` rejecting
     no_geometry / non_numeric / null_island / out_of_bbox); malformed-geometry-
     resilient `point_of` (never raises); `reconcile_count()` pull vs advertised
-    count. 27 offline tests (fake session, no network).
+    count. **Deterministic pagination:** `paging_metadata()`/`stable_order_field()`
+    page with `orderByFields=<objectIdField> ASC` and fail loud if pagination is
+    advertised but no stable ordering field / orderBy support exists — so
+    resume-by-offset cannot gap or duplicate; the object-id field + order is
+    preserved in the run manifest `source_metadata`. 36 offline tests.
   - **Implementation status:** ✅ complete & tested (offline, faked session).
   - **Live-source verification status:** 🔴 **BLOCKED** — outbound to
     `gis.hctx.net` denied by network policy. Cannot confirm the live layer

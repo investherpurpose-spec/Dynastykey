@@ -71,10 +71,13 @@ spine). No external dependencies. This is the milestone that proves the pipeline
   - **Implementation status:** ✅ complete & tested (injected fake stages).
   - **Live-source verification status:** 🔴 BLOCKED — default HCAD/GIS stages
     need live access; only orchestration is verified offline.
-- [ ] **Monitoring & logging**
-  - Structured run log + a machine-readable run manifest per nightly run
-    (counts, deltas, freshness, status); alert hook on FAIL/PARTIAL.
-  - *Acceptance:* every run emits a manifest; a failing run is visibly flagged.
+- [x] **Monitoring & logging** (`scraper/monitoring.py`) — **DONE**
+  - Structured JSON-lines event log (`make_logger`), durable per-run manifest
+    archive with retention (`prune_runs`), alert emission on any non-PASS run to
+    `notifications.log` (`emit_alert`), and a health/status reader
+    (`run_history`, `summarize_health`, `format_health`, consecutive-failure
+    streak) surfaced via `nightly.py --status`. No external platform/framework.
+    Wired into the runner. 10 tests.
 - [ ] **Identity-resolution spine check**
   - Measure parcels↔owner join rate after load; expose it as a validation metric.
   - *Acceptance:* join rate below threshold trips a validation warning.

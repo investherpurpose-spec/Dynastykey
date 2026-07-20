@@ -40,6 +40,8 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from scraper import monitoring  # noqa: E402  (needs sys.path above)
+
 EXIT_PASS = 0
 EXIT_PARTIAL = 1
 EXIT_FAIL = 2
@@ -250,18 +252,6 @@ def _write_json(path: Path, obj: dict) -> None:
     tmp.replace(path)
 
 
-def _make_logger(work_dir: Path):
-    log_path = Path(work_dir) / "nightly.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    def log(event: str, **fields):
-        rec = {"ts": _now().isoformat(), "event": event}
-        rec.update(fields)
-        with open(log_path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, default=str) + "\n")
-    return log
-
-
 # --------------------------------------------------------------------------
 # Default spine stages (wired to the real importers; injected fakes in tests).
 # The identity-join stage is inserted by the identity-spine backlog item.
@@ -354,7 +344,7 @@ def run_nightly(county_id: str, work_dir, *, db_path=None, exports_dir=None,
     work_dir = Path(work_dir)
     db_path = Path(db_path) if db_path else work_dir / "dynastykey.db"
     exports_dir = Path(exports_dir) if exports_dir else work_dir / "exports"
-    log = _make_logger(work_dir)
+    log = monitoring.make_logger(work_dir)
 
     lock = FileLock(work_dir / "nightly.lock")
     if not lock.acquire():
@@ -432,6 +422,13 @@ def run_nightly(county_id: str, work_dir, *, db_path=None, exports_dir=None,
         if manifest.published:
             _write_json(work_dir / "latest_success.json", manifest.to_dict())
 
+        # monitoring: retain a bounded archive, and alert on any non-PASS run.
+        monitoring.prune_runs(work_dir)
+        if manifest.status != PASS:
+            alert = monitoring.emit_alert(work_dir, manifest.to_dict())
+            log("alert_emitted", run_id=run_id, status=manifest.status,
+                failed_stages=alert["failed_stages"])
+
         log("run_finished", run_id=run_id, status=manifest.status,
             completed=manifest.completed, published=manifest.published,
             duration_s=round(manifest.duration_s, 4))
@@ -453,11 +450,16 @@ def _build_arg_parser():
     p.add_argument("--gis-limit", type=int, default=None)
     p.add_argument("--geometry", action="store_true")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--status", action="store_true",
+                   help="print run health from the work-dir and exit")
     return p
 
 
 def main(argv=None) -> int:
     args = _build_arg_parser().parse_args(argv)
+    if args.status:
+        print(monitoring.format_health(monitoring.summarize_health(args.work_dir)))
+        return EXIT_PASS
     params = {
         "hcad_zip": args.hcad_zip, "hcad_year": args.hcad_year,
         "gis_layer": args.gis_layer, "gis_limit": args.gis_limit,

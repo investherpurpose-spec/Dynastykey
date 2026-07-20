@@ -60,10 +60,17 @@ spine). No external dependencies. This is the milestone that proves the pipeline
     dependency and the live file to build against; not added under the
     architecture freeze without live access. **NOT production-certified** until a
     network-enabled run validates the live layer.
-- [ ] **Nightly runner** (`scripts/nightly.py`)
-  - Orchestrate pull-parcels → load-owners → identity-spine join → validation
-    gates; exit codes PASS/PARTIAL/FAIL; preserve last-good output on failure.
-  - *Acceptance:* one command runs the spine end to end and gates on validation.
+- [x] **Nightly runner** (`scripts/nightly.py`) — **IMPLEMENTATION DONE**
+  - Orchestrates classified stages preflight → hcad_load → gis_pull → validation
+    → publish (identity-join inserted by the spine item). Unique run_id + git
+    code_version; per-stage durations/rows/warnings/errors; critical vs
+    non-critical stages; PASS/PARTIAL/FAIL exit 0/1/2; atomic stale-aware file
+    lock (exit 3 if already running); run-completion vs publication tracked
+    separately; latest_attempt vs latest_success preserved (failed run never
+    clobbers last good). Does not duplicate importer last-good logic. 13 tests.
+  - **Implementation status:** ✅ complete & tested (injected fake stages).
+  - **Live-source verification status:** 🔴 BLOCKED — default HCAD/GIS stages
+    need live access; only orchestration is verified offline.
 - [ ] **Monitoring & logging**
   - Structured run log + a machine-readable run manifest per nightly run
     (counts, deltas, freshness, status); alert hook on FAIL/PARTIAL.

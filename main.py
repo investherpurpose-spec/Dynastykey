@@ -89,8 +89,13 @@ def cmd_pull_parcels(args):
 def cmd_load_owners(args):
     conn = db.connect(args.db)
     zip_path = args.zip or hcad_bulk.download_bulk_zip(args.year)
-    total = hcad_bulk.load_owners(conn, zip_path, limit=args.limit)
-    print(f"done: {total} owner rows loaded into table '{hcad_bulk.OWNERS_TABLE}'")
+    m = hcad_bulk.load_owners(conn, zip_path, limit=args.limit, resume=args.resume)
+    print(f"done [{m.status}]: {m.rows_inserted} owner rows loaded into "
+          f"'{hcad_bulk.OWNERS_TABLE}' "
+          f"(read {m.rows_read}, {m.duplicates} duplicates, "
+          f"{m.quarantined} quarantined, reconciled={m.reconciled})")
+    if m.expected_missing:
+        print(f"  note: expected columns absent: {m.expected_missing}")
 
 
 def _resolve_table_field(conn, args):
@@ -206,6 +211,7 @@ def build_parser() -> argparse.ArgumentParser:
     lo.add_argument("--year", type=int, default=2025)
     lo.add_argument("--zip", default=None, help="use an already-downloaded Real_acct_owner.zip")
     lo.add_argument("--limit", type=int, default=None)
+    lo.add_argument("--resume", action="store_true", help="continue an interrupted load")
     lo.set_defaults(func=cmd_load_owners)
 
     def add_match_args(sp):

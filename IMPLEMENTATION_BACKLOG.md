@@ -27,11 +27,22 @@ spine). No external dependencies. This is the milestone that proves the pipeline
     structured PASS/PARTIAL/FAIL report. Default `HARRIS_SPINE_SPECS` for the
     parcels+owners spine. Wired as `python main.py validate` (exit 2=FAIL,
     1=PARTIAL, 0=PASS so nightly automation/CI can gate on it). 22 unit tests.
-- [ ] **Harden HCAD bulk importer** (`scraper/hcad_bulk.py`)
-  - Confirm/parametrize live URL; assert required columns before load
-    (SchemaDrift fail-loud); expose the field map; record source/published date.
-  - *Acceptance:* missing required column fails the run instead of loading; a
-    live sample validates.
+- [x] **Harden HCAD bulk importer** (`scraper/hcad_bulk.py`) — **IMPLEMENTATION DONE**
+  - Implemented: input/file checks; fail-loud required-column (`acct`) assertion
+    (`HCADSchemaError`) + expected-column (`mailto`/`mail_addr_1`) warning;
+    chunked/streaming load into a STAGING table with atomic swap; checkpointed
+    safe resume (`--resume`); duplicate `acct` handling (UNIQUE + INSERT OR
+    IGNORE, keep-first); malformed-row quarantine (`{table}__quarantine`, with
+    reasons); row-count reconciliation; `LoadManifest` metrics persisted to
+    `_load_manifest`; last-good-output preservation (old table untouched until
+    swap); atomic verified download (`.part` + `is_zipfile`). 18 fixture tests.
+  - **Implementation status:** ✅ complete & tested (offline, real-zip fixtures).
+  - **Live-source verification status:** 🔴 **BLOCKED** — outbound to
+    `download.hcad.org` / `hcad.org` denied by network policy. Cannot confirm the
+    live URL currency, the true column list vs the PDATA codebook, or real record
+    counts. Grounded columns only (`acct`, `mailto`, `mail_addr_1`) are assumed;
+    the exact schema stays UNVERIFIED. **NOT production-certified** until a
+    network-enabled run validates a live sample.
 - [ ] **Harden ArcGIS pipeline** (`scraper/arcgis.py`)
   - Verify live layer metadata; add shapefile-download fallback path; geospatial
     sanity (centroid within Harris bbox); endpoint-moved → MapServer/`discover`.

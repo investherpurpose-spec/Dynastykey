@@ -206,6 +206,7 @@ class RunManifest:
     county_id: str
     code_version: str
     started_at: str
+    profile: str = "production"
     ended_at: str = ""
     duration_s: float = 0.0
     status: str = FAIL
@@ -217,7 +218,8 @@ class RunManifest:
     def to_dict(self) -> dict:
         return {
             "run_id": self.run_id, "county_id": self.county_id,
-            "code_version": self.code_version, "started_at": self.started_at,
+            "code_version": self.code_version, "profile": self.profile,
+            "started_at": self.started_at,
             "ended_at": self.ended_at, "duration_s": round(self.duration_s, 4),
             "status": self.status, "completed": self.completed,
             "published": self.published,
@@ -293,17 +295,34 @@ def _stage_hcad(ctx: NightlyContext) -> StageOutcome:
 def _stage_gis(ctx: NightlyContext) -> StageOutcome:
     from scraper import arcgis, db
     layer = ctx.params.get("gis_layer") or arcgis.HARRIS_PARCELS_LAYER
-    info = arcgis.get_layer_info(layer)
     table = ctx.params.get("gis_table", "parcels")
+    geometry = ctx.params.get("geometry", False)
+    where = ctx.params.get("gis_where", "1=1")
+    limit = ctx.params.get("gis_limit")
+
+    resolved, info = arcgis.resolve_layer(layer)
     fields = info.get("fields") or []
-    mapping = db.create_feature_table(ctx.conn, table, fields,
-                                      ctx.params.get("geometry", False))
-    feats = arcgis.iter_features(layer, include_geometry=ctx.params.get("geometry", False),
-                                 limit=ctx.params.get("gis_limit"))
-    total = db.insert_features(ctx.conn, table, mapping, feats,
-                               ctx.params.get("geometry", False), arcgis.point_of,
-                               layer_url=layer)
-    return StageOutcome(rows=total, detail=f"parcels layer -> {table}")
+
+    # expected count for reconciliation: the layer's count, capped by any limit.
+    expected = None
+    try:
+        expected = arcgis.count_features(resolved, where=where)
+        if limit:
+            expected = min(expected, limit)
+    except arcgis.ArcGISError:
+        pass
+
+    def make_features(start):
+        return arcgis.iter_features(resolved, where=where, include_geometry=geometry,
+                                    start_offset=start, limit=limit)
+
+    total = db.load_features_staged(
+        ctx.conn, table, fields, make_features, geometry, arcgis.point_of,
+        layer_url=resolved, expected_count=expected,
+        resume=ctx.params.get("resume", False),
+        reconcile_tolerance=ctx.params.get("gis_reconcile_tolerance", 0.02))
+    return StageOutcome(rows=total,
+                        detail=f"parcels layer -> {table} (staged+promoted)")
 
 
 def _stage_identity(ctx: NightlyContext) -> StageOutcome:
@@ -322,11 +341,20 @@ def _stage_identity(ctx: NightlyContext) -> StageOutcome:
 
 def _stage_validation(ctx: NightlyContext) -> StageOutcome:
     from scraper import validate
-    reports = validate.validate_many(ctx.conn, validate.HARRIS_SPINE_SPECS)
+    # Trial runs validate against bounded-population bands supplied by the
+    # operator; production runs use the production spine bands. Trial bands
+    # never replace the production defaults.
+    if ctx.params.get("profile") == "trial":
+        specs = validate.trial_specs(ctx.params["trial_parcels"],
+                                     ctx.params["trial_owners"])
+    else:
+        specs = validate.HARRIS_SPINE_SPECS
+    reports = validate.validate_many(ctx.conn, specs)
     overall = validate.overall_status(reports)
     warnings = [r for rep in reports for r in rep.reasons()]
     return StageOutcome(validation_status=overall, warnings=warnings,
-                        detail=f"spine validation {overall}")
+                        detail=f"spine validation {overall} "
+                               f"(profile={ctx.params.get('profile', 'production')})")
 
 
 def _stage_publish(ctx: NightlyContext) -> StageOutcome:
@@ -346,10 +374,14 @@ def default_steps() -> list:
     ]
 
 
-def _prior_spine_metrics(work_dir) -> Optional[dict]:
-    """Pull the spine metrics recorded by the last successful run, if any."""
+def _prior_spine_metrics(work_dir, profile: str = "production") -> Optional[dict]:
+    """Spine metrics from the last successful run of the SAME profile, if any.
+
+    Profile scoping prevents a bounded trial run from being compared against
+    (or becoming the baseline for) a full production run.
+    """
     suc = monitoring.latest_success(work_dir)
-    if not suc:
+    if not suc or suc.get("profile", "production") != profile:
         return None
     for stage in suc.get("stages", []):
         if stage.get("name") == "identity_join":
@@ -385,14 +417,16 @@ def run_nightly(county_id: str, work_dir, *, db_path=None, exports_dir=None,
     try:
         start = now or _now()
         run_id = new_run_id(start)
+        run_params = dict(params or {})
+        profile = run_params.get("profile", "production")
         manifest = RunManifest(
             run_id=run_id, county_id=county_id,
             code_version=code_ver or code_version(),
-            started_at=start.isoformat())
-        run_params = dict(params or {})
+            profile=profile, started_at=start.isoformat())
         # make the prior successful run's spine metrics available for regression
-        # comparison, unless the caller already supplied a baseline.
-        run_params.setdefault("prior_spine", _prior_spine_metrics(work_dir))
+        # comparison, unless the caller already supplied a baseline. Scoped to
+        # the same profile so trial and production baselines never cross.
+        run_params.setdefault("prior_spine", _prior_spine_metrics(work_dir, profile))
         ctx = NightlyContext(county_id, work_dir, db_path, exports_dir, run_params, log)
         log("run_started", run_id=run_id, county=county_id,
             code_version=manifest.code_version)
@@ -484,8 +518,16 @@ def _build_arg_parser():
     p.add_argument("--hcad-year", type=int, default=None)
     p.add_argument("--gis-layer", default=None)
     p.add_argument("--gis-limit", type=int, default=None)
+    p.add_argument("--gis-where", default="1=1",
+                   help="ArcGIS where clause (e.g. a HCAD_NUM subset for a matched trial)")
     p.add_argument("--geometry", action="store_true")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--profile", choices=["production", "trial"], default="production",
+                   help="'trial' uses bounded-population validation bands")
+    p.add_argument("--trial-parcels", type=int, default=None,
+                   help="expected parcel count for a trial run (required with --profile trial)")
+    p.add_argument("--trial-owners", type=int, default=None,
+                   help="expected owner count for a trial run (required with --profile trial)")
     p.add_argument("--status", action="store_true",
                    help="print run health from the work-dir and exit")
     return p
@@ -496,10 +538,16 @@ def main(argv=None) -> int:
     if args.status:
         print(monitoring.format_health(monitoring.summarize_health(args.work_dir)))
         return EXIT_PASS
+    if args.profile == "trial" and (args.trial_parcels is None or args.trial_owners is None):
+        print("error: --profile trial requires --trial-parcels and --trial-owners",
+              file=sys.stderr)
+        return EXIT_FAIL
     params = {
         "hcad_zip": args.hcad_zip, "hcad_year": args.hcad_year,
         "gis_layer": args.gis_layer, "gis_limit": args.gis_limit,
-        "geometry": args.geometry, "resume": args.resume,
+        "gis_where": args.gis_where, "geometry": args.geometry, "resume": args.resume,
+        "profile": args.profile, "trial_parcels": args.trial_parcels,
+        "trial_owners": args.trial_owners,
     }
     return run_nightly(args.county, args.work_dir, db_path=args.db,
                        exports_dir=args.exports_dir, params=params)

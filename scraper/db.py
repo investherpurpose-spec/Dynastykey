@@ -107,6 +107,87 @@ def insert_features(
     return total
 
 
+class FeatureReconcileError(RuntimeError):
+    """Staged feature count fell short of the layer's advertised count."""
+
+
+def _ensure_scrape_meta(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS _scrape_meta (
+               table_name TEXT PRIMARY KEY, layer_url TEXT,
+               rows_fetched INTEGER DEFAULT 0,
+               updated_at TEXT DEFAULT (datetime('now')))""")
+
+
+def staging_name(table: str) -> str:
+    return f"{table}__staging"
+
+
+def promote_staging(conn: sqlite3.Connection, staging: str, table: str) -> None:
+    """Atomically replace `table` with `staging` (drop + rename in one commit).
+
+    This is the ONLY point a completed pull becomes current. Until it runs, the
+    previous `table` is untouched, so a partial/failed pull can never be served.
+    """
+    _ensure_scrape_meta(conn)
+    conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+    conn.execute(f'ALTER TABLE "{staging}" RENAME TO "{table}"')
+    conn.execute("DELETE FROM _scrape_meta WHERE table_name=?", (table,))
+    conn.execute("UPDATE _scrape_meta SET table_name=? WHERE table_name=?",
+                 (table, staging))
+    conn.commit()
+
+
+def load_features_staged(
+    conn: sqlite3.Connection,
+    table: str,
+    esri_fields: list,
+    make_features,
+    with_geometry: bool,
+    point_fn,
+    layer_url: str = "",
+    expected_count: Optional[int] = None,
+    resume: bool = False,
+    reconcile_tolerance: float = 0.0,
+    batch_size: int = 500,
+) -> int:
+    """Pull ArcGIS features into a STAGING table, reconcile, then atomically
+    promote it to `table` — so the live parcels table survives a failed pull.
+
+    `make_features(start_offset)` builds the feature iterator; on resume it is
+    called with the number of rows already staged so the pull continues where it
+    left off. A mid-pagination failure propagates out of here BEFORE promotion,
+    leaving `table` untouched and the partial data quarantined in staging.
+    """
+    _ensure_scrape_meta(conn)
+    staging = staging_name(table)
+
+    if not resume:
+        conn.execute(f'DROP TABLE IF EXISTS "{staging}"')
+        conn.execute("DELETE FROM _scrape_meta WHERE table_name=?", (staging,))
+        conn.commit()
+
+    mapping = create_feature_table(conn, staging, esri_fields, with_geometry)
+    start = conn.execute(f'SELECT COUNT(*) FROM "{staging}"').fetchone()[0] if resume else 0
+
+    # A failure inside insert_features (a raising feature generator) propagates
+    # here and returns to the caller WITHOUT promoting — table stays current.
+    insert_features(conn, staging, mapping, make_features(start), with_geometry,
+                    point_fn, batch_size=batch_size, layer_url=layer_url)
+
+    total = conn.execute(f'SELECT COUNT(*) FROM "{staging}"').fetchone()[0]
+
+    if expected_count is not None and expected_count > 0:
+        floor = expected_count * (1.0 - reconcile_tolerance)
+        if total < floor:
+            raise FeatureReconcileError(
+                f"staged {total} features, expected ~{expected_count} "
+                f"(floor {floor:.0f}); NOT promoting '{table}'")
+
+    promote_staging(conn, staging, table)
+    return total
+
+
 def rows_fetched(conn: sqlite3.Connection, table: str) -> int:
     row = conn.execute(
         "SELECT rows_fetched FROM _scrape_meta WHERE table_name=?", (table,)

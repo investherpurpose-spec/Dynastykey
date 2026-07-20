@@ -278,6 +278,60 @@ def test_prior_spine_metrics_passed_to_next_run(tmp_path):
     assert seen["prior"]["unique_accounts"] == 1000
 
 
+def _populate_step(n_parcels, n_owners):
+    def fn(ctx):
+        c = ctx.conn
+        c.execute('CREATE TABLE parcels (hcad_num TEXT, site_addr_1 TEXT)')
+        c.execute('CREATE TABLE owners (acct TEXT, mailto TEXT, mail_addr_1 TEXT)')
+        c.executemany('INSERT INTO parcels VALUES (?,?)',
+                      [(str(i), "ADDR") for i in range(n_parcels)])
+        c.executemany('INSERT INTO owners VALUES (?,?,?)',
+                      [(str(i), "OWNER", "MAIL") for i in range(n_owners)])
+        c.commit()
+        return nightly.StageOutcome(rows=n_parcels)
+    return nightly.Stage("load", True, fn)
+
+
+def _real_spine_steps(n_parcels, n_owners):
+    return [
+        _ok_stage("preflight"),
+        _populate_step(n_parcels, n_owners),
+        nightly.Stage("identity_join", True, nightly._stage_identity),
+        nightly.Stage("validation", True, nightly._stage_validation),
+        _publish_stage(),
+    ]
+
+
+def test_trial_profile_passes_bounded_population(tmp_path):
+    db_path = tmp_path / "trial.db"
+    params = {"profile": "trial", "trial_parcels": 500, "trial_owners": 500}
+    code = nightly.run_nightly("harris", tmp_path, db_path=db_path,
+                               steps=_real_spine_steps(500, 500), params=params)
+    assert code == nightly.EXIT_PASS
+    att = _read(tmp_path / "latest_attempt.json")
+    assert att["profile"] == "trial"
+    assert att["published"] is True
+
+
+def test_production_profile_fails_bounded_population(tmp_path):
+    # same 500/500 data under production bands must FAIL (not silently pass)
+    db_path = tmp_path / "prod.db"
+    code = nightly.run_nightly("harris", tmp_path, db_path=db_path,
+                               steps=_real_spine_steps(500, 500))
+    assert code == nightly.EXIT_FAIL
+    assert _read(tmp_path / "latest_attempt.json")["published"] is False
+
+
+def test_trial_baseline_not_used_by_production(tmp_path):
+    # a trial run publishes a trial baseline
+    nightly.run_nightly("harris", tmp_path, db_path=tmp_path / "t.db",
+                        steps=_spine_steps({"unique_parcels": 500, "unique_accounts": 500}),
+                        params={"profile": "trial", "trial_parcels": 500, "trial_owners": 500})
+    # but a production run must NOT see the trial metrics as its prior baseline
+    assert nightly._prior_spine_metrics(tmp_path, "production") is None
+    assert nightly._prior_spine_metrics(tmp_path, "trial") is not None
+
+
 def test_real_spine_stage_fails_on_regression(tmp_path):
     # Build a DB and use the REAL identity stage to prove regression -> FAIL,
     # no publish, and prior success preserved.

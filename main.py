@@ -4,7 +4,7 @@
 Typical workflow:
     python main.py discover https://www.gis.hctx.net/arcgishcpid/rest/services/HCAD/Parcels/FeatureServer/0
     python main.py pull-parcels                       # bulk-pull all parcels into SQLite
-    python main.py load-owners --year 2025            # load HCAD bulk owner names
+    python main.py load-owners --year 2026            # load HCAD bulk owner names (confirm year on hcad.org/pdata)
     python main.py match --name "JOHN SMITH"          # match names against the DB
     python main.py match --names-file leads.txt --csv matches.csv
     python main.py claude-match --names-file leads.txt   # LLM-assisted matching
@@ -17,6 +17,7 @@ import csv
 import json
 import logging
 import sys
+from datetime import date
 
 from scraper import arcgis, db, hcad_bulk, names, validate
 
@@ -88,7 +89,8 @@ def cmd_pull_parcels(args):
 
 def cmd_load_owners(args):
     conn = db.connect(args.db)
-    zip_path = args.zip or hcad_bulk.download_bulk_zip(args.year)
+    year = args.year or date.today().year  # never a stale hardcoded year
+    zip_path = args.zip or hcad_bulk.download_bulk_zip(year)
     m = hcad_bulk.load_owners(conn, zip_path, limit=args.limit, resume=args.resume)
     print(f"done [{m.status}]: {m.rows_inserted} owner rows loaded into "
           f"'{hcad_bulk.OWNERS_TABLE}' "
@@ -208,7 +210,9 @@ def build_parser() -> argparse.ArgumentParser:
     pp.set_defaults(func=cmd_pull_parcels)
 
     lo = sub.add_parser("load-owners", help="download + load HCAD bulk owner data (real_acct)")
-    lo.add_argument("--year", type=int, default=2025)
+    lo.add_argument("--year", type=int, default=None,
+                    help="HCAD data year; defaults to the current calendar year. "
+                         "CONFIRM the available year against hcad.org/pdata before a real load.")
     lo.add_argument("--zip", default=None, help="use an already-downloaded Real_acct_owner.zip")
     lo.add_argument("--limit", type=int, default=None)
     lo.add_argument("--resume", action="store_true", help="continue an interrupted load")

@@ -3,6 +3,7 @@
 Offline: builds a throwaway SQLite DB, so no network or real data is needed.
 """
 
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -229,6 +230,37 @@ def test_overall_status_aggregation():
     assert validate.overall_status([ok]) == validate.PASS
     assert validate.overall_status([ok, warn]) == validate.PARTIAL
     assert validate.overall_status([ok, warn, fail]) == validate.FAIL
+
+
+def test_trial_specs_pass_small_population_where_production_fails():
+    conn = _conn()
+    # a bounded 500/500 population
+    conn.execute('CREATE TABLE parcels (hcad_num TEXT, site_addr_1 TEXT)')
+    conn.execute('CREATE TABLE owners (acct TEXT, mailto TEXT)')
+    conn.executemany('INSERT INTO parcels VALUES (?,?)', [(str(i), "A") for i in range(500)])
+    conn.executemany('INSERT INTO owners VALUES (?,?)', [(str(i), "O") for i in range(500)])
+    conn.commit()
+
+    # production bands (1.2M-1.8M) must FAIL on 500 rows
+    prod = validate.validate_many(conn, validate.HARRIS_SPINE_SPECS)
+    assert validate.overall_status(prod) == validate.FAIL
+
+    # trial bands centered on 500 must PASS the same data
+    trial = validate.validate_many(conn, validate.trial_specs(500, 500))
+    assert validate.overall_status(trial) == validate.PASS
+
+
+def test_trial_specs_do_not_mutate_production():
+    before = json.loads(json.dumps(validate.HARRIS_SPINE_SPECS))
+    validate.trial_specs(500, 500)
+    assert validate.HARRIS_SPINE_SPECS == before  # production bands untouched
+
+
+def test_trial_band_math():
+    specs = validate.trial_specs(1000, 2000, tol=0.2)
+    parcels = next(s for s in specs if s["table"] == "parcels")
+    assert parcels["row_count"]["min_expected"] == 800
+    assert parcels["row_count"]["max_expected"] == 1201
 
 
 def test_report_to_dict_shape():

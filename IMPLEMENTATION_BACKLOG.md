@@ -21,6 +21,15 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done
 Goal: a stable, gated, monitored nightly run on Property + GIS (the identity
 spine). No external dependencies. This is the milestone that proves the pipeline.
 
+> **Certification language.** A successful live run marks source access + schema
+> **LIVE VERIFIED** only — it does NOT make the system **PRODUCTION CERTIFIED**.
+> Production certification requires the full 8-item procedure in
+> `docs/harris_p0_certification.md` (verified metadata/fields, controlled sample
+> inspection, complete baseline run, source-count reconciliation, manually
+> checked parcel matches, ≥3 repeated scheduled PASS runs, a forced-failure
+> recovery test, and no silent publication of partial data). All live items
+> remain 🔴 BLOCKED in the build environment.
+
 - [x] **Add validation gates** (`scraper/validate.py`) — **DONE**
   - Row-count band, required-field non-null rate, duplicate-key rate, freshness
     from `_scrape_meta.updated_at`, and parcels↔owner join rate; returns a
@@ -60,6 +69,19 @@ spine). No external dependencies. This is the milestone that proves the pipeline
     dependency and the live file to build against; not added under the
     architecture freeze without live access. **NOT production-certified** until a
     network-enabled run validates the live layer.
+- [x] **GIS staged load / last-good preservation** (`scraper/db.py`) — **DONE**
+  - `load_features_staged` + `promote_staging`: GIS pulls land in
+    `parcels__staging` and are atomically swapped into the live `parcels` table
+    only after count reconciliation, so a mid-pagination failure or shortfall
+    (`FeatureReconcileError`) can never make partial GIS output current;
+    `--resume` continues staging. Nightly `gis_pull` uses it. 6 proof tests
+    (`tests/test_db_staged.py`). Closes the gap where the old direct-write pull
+    could publish a partial parcels table.
+- [x] **Controlled-trial mode** (`validate.trial_specs` + `nightly --profile trial`) — **DONE**
+  - Bounded-population validation bands from operator-supplied denominators;
+    rate checks stay at production strength; production `HARRIS_SPINE_SPECS`
+    never mutated; trial/production baselines profile-scoped so they never cross.
+    Prevents mismatched-population sample runs. 6 tests.
 - [x] **Nightly runner** (`scripts/nightly.py`) — **IMPLEMENTATION DONE**
   - Orchestrates classified stages preflight → hcad_load → gis_pull → validation
     → publish (identity-join inserted by the spine item). Unique run_id + git

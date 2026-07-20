@@ -323,6 +323,44 @@ HARRIS_SPINE_SPECS = [
 ]
 
 
+def trial_specs(parcels_expected: int, owners_expected: int,
+                tol: float = 0.2) -> list[dict]:
+    """Bounded-population spine specs for a CONTROLLED TRIAL run.
+
+    Count bands are centered on the operator-supplied expected counts for the
+    bounded population (± tol); the rate-based checks (required-field non-null,
+    duplicate rate, join rate) are population-independent and stay at production
+    strength. This does NOT modify HARRIS_SPINE_SPECS — production thresholds are
+    never weakened to make a sample pass. Use with a matched trial population
+    (a defined account subset and its parcels) or explicit denominators.
+    """
+    def band(n: int) -> dict:
+        return {"min_expected": max(1, int(n * (1 - tol))),
+                "max_expected": int(n * (1 + tol)) + 1}
+
+    return [
+        {
+            "table": "parcels",
+            "row_count": band(parcels_expected),
+            "required_nonnull": [{"column": "hcad_num", "min_rate": 0.99}],
+            "duplicate_rate": [{"key_column": "hcad_num", "max_rate": 0.01,
+                                "severity": "warn"}],
+            "join_rate": [{"left_key": "hcad_num", "right_table": "owners",
+                           "right_key": "acct", "min_rate": 0.9}],
+        },
+        {
+            "table": "owners",
+            "row_count": band(owners_expected),
+            "required_nonnull": [
+                {"column": "acct", "min_rate": 0.999},
+                {"column": "mailto", "min_rate": 0.9, "severity": "warn"},
+            ],
+            "duplicate_rate": [{"key_column": "acct", "max_rate": 0.001,
+                                "severity": "warn"}],
+        },
+    ]
+
+
 def validate_many(conn: sqlite3.Connection, specs: list[dict]) -> list[ValidationReport]:
     return [validate_table(conn, s) for s in specs]
 

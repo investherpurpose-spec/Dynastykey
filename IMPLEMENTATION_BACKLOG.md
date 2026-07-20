@@ -43,11 +43,23 @@ spine). No external dependencies. This is the milestone that proves the pipeline
     counts. Grounded columns only (`acct`, `mailto`, `mail_addr_1`) are assumed;
     the exact schema stays UNVERIFIED. **NOT production-certified** until a
     network-enabled run validates a live sample.
-- [ ] **Harden ArcGIS pipeline** (`scraper/arcgis.py`)
-  - Verify live layer metadata; add shapefile-download fallback path; geospatial
-    sanity (centroid within Harris bbox); endpoint-moved → MapServer/`discover`.
-  - *Acceptance:* endpoint drift degrades gracefully to fallback; bad geometry
-    rejected with a reason.
+- [x] **Harden ArcGIS pipeline** (`scraper/arcgis.py`) — **IMPLEMENTATION DONE**
+  - Implemented: retry hardening (permanent 4xx / bad-query → `ArcGISPermanentError`
+    fail-fast, transient 5xx/429/network retried, no sleep after final attempt);
+    `resolve_layer()` endpoint fallback (primary FeatureServer → MapServer mirror)
+    wired into `iter_features` so a moved endpoint degrades instead of aborting;
+    geospatial sanity (`HARRIS_BBOX`, `in_bbox`, `validate_point` rejecting
+    no_geometry / non_numeric / null_island / out_of_bbox); malformed-geometry-
+    resilient `point_of` (never raises); `reconcile_count()` pull vs advertised
+    count. 27 offline tests (fake session, no network).
+  - **Implementation status:** ✅ complete & tested (offline, faked session).
+  - **Live-source verification status:** 🔴 **BLOCKED** — outbound to
+    `gis.hctx.net` denied by network policy. Cannot confirm the live layer
+    endpoint currency, field list, `supportsPagination`, or real feature count.
+    **Shapefile-download fallback deferred** — it needs a new shapefile
+    dependency and the live file to build against; not added under the
+    architecture freeze without live access. **NOT production-certified** until a
+    network-enabled run validates the live layer.
 - [ ] **Nightly runner** (`scripts/nightly.py`)
   - Orchestrate pull-parcels → load-owners → identity-spine join → validation
     gates; exit codes PASS/PARTIAL/FAIL; preserve last-good output on failure.

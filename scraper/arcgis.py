@@ -32,9 +32,19 @@ HARRIS_PARCELS_MAPSERVER = (
     "https://www.gis.hctx.net/arcgis/rest/services/HCAD/Parcels/MapServer/0"
 )
 
+# Approximate WGS84 bounding box for Harris County, TX. Public geographic fact,
+# used only for gross centroid sanity (reject null-island / out-of-region
+# points) — NOT a precise boundary test. Kept slightly loose to avoid false
+# rejects on edge parcels.
+HARRIS_BBOX = (-96.05, 29.40, -94.85, 30.25)  # (min_lon, min_lat, max_lon, max_lat)
+
 
 class ArcGISError(RuntimeError):
     pass
+
+
+class ArcGISPermanentError(ArcGISError):
+    """A non-retryable ArcGIS error (e.g. bad field, 4xx) — fail fast."""
 
 
 def _session() -> requests.Session:
@@ -45,21 +55,49 @@ def _session() -> requests.Session:
     return s
 
 
-def _get_json(session: requests.Session, url: str, params: dict) -> dict:
-    """GET with retries/backoff. ArcGIS returns errors inside a 200 body."""
+def _is_permanent_status(status: Optional[int]) -> bool:
+    # 4xx client errors are permanent, except 429 (rate limit -> retry).
+    return status is not None and 400 <= status < 500 and status != 429
+
+
+def _get_json(session: requests.Session, url: str, params: dict,
+              max_retries: int = MAX_RETRIES) -> dict:
+    """GET with retries/backoff. ArcGIS returns errors inside a 200 body.
+
+    Retries transient failures (network, decode, 5xx, 429) with exponential
+    backoff, but raises ArcGISPermanentError immediately on non-retryable
+    client errors (4xx, bad query) so we don't hammer a request that can never
+    succeed. No sleep after the final attempt.
+    """
     last_exc: Optional[Exception] = None
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(max_retries):
         try:
             resp = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            status = getattr(resp, "status_code", None)
+            if _is_permanent_status(status):
+                raise ArcGISPermanentError(f"HTTP {status} for {url}")
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, dict) and "error" in data:
-                raise ArcGISError(json.dumps(data["error"]))
+                err = data["error"] or {}
+                code = err.get("code") if isinstance(err, dict) else None
+                try:
+                    code = int(code) if code is not None else None
+                except (TypeError, ValueError):
+                    code = None
+                if _is_permanent_status(code):
+                    raise ArcGISPermanentError(json.dumps(err))
+                raise ArcGISError(json.dumps(err))
             return data
+        except ArcGISPermanentError:
+            raise
         except (requests.RequestException, ValueError, ArcGISError) as exc:
             last_exc = exc
+            if attempt == max_retries - 1:
+                break
             wait = 2**attempt
-            log.warning("request failed (%s), retry %d/%d in %ss", exc, attempt + 1, MAX_RETRIES, wait)
+            log.warning("request failed (%s), retry %d/%d in %ss",
+                        exc, attempt + 1, max_retries, wait)
             time.sleep(wait)
     raise ArcGISError(f"giving up on {url}: {last_exc}")
 
@@ -74,13 +112,86 @@ def get_service_info(service_url: str) -> dict:
     return _get_json(_session(), service_url.rstrip("/"), {"f": "json"})
 
 
-def count_features(layer_url: str, where: str = "1=1") -> int:
+def count_features(layer_url: str, where: str = "1=1",
+                   session: Optional[requests.Session] = None) -> int:
     data = _get_json(
-        _session(),
+        session or _session(),
         layer_url.rstrip("/") + "/query",
         {"where": where, "returnCountOnly": "true", "f": "json"},
     )
     return int(data.get("count", 0))
+
+
+def resolve_layer(layer_url: str, fallbacks: Optional[list] = None,
+                  session: Optional[requests.Session] = None) -> tuple[str, dict]:
+    """Return (working_url, layer_info), trying fallbacks if the primary moved.
+
+    ArcGIS endpoints move over time, so a nightly run should degrade to a known
+    alternate (e.g. the MapServer mirror) instead of failing. If `fallbacks` is
+    None and the primary is the Harris parcels FeatureServer, the MapServer
+    mirror is tried automatically.
+    """
+    session = session or _session()
+    if fallbacks is None:
+        fallbacks = ([HARRIS_PARCELS_MAPSERVER]
+                     if layer_url.rstrip("/") == HARRIS_PARCELS_LAYER else [])
+    candidates = [layer_url] + list(fallbacks)
+    last_exc: Optional[Exception] = None
+    for cand in candidates:
+        try:
+            info = get_layer_info(cand, session)
+            if isinstance(info, dict) and ("fields" in info or info.get("type")):
+                if cand != layer_url:
+                    log.warning("primary layer unavailable; using fallback %s", cand)
+                return cand, info
+            last_exc = ArcGISError(f"{cand}: response is not a layer")
+        except ArcGISError as exc:
+            last_exc = exc
+            log.warning("layer probe failed for %s: %s", cand, exc)
+    raise ArcGISError(f"no working layer endpoint among {candidates}: {last_exc}")
+
+
+def reconcile_count(expected: Optional[int], got: int,
+                    tolerance: float = 0.0) -> tuple[bool, str]:
+    """Compare a pulled row count against the layer's advertised count.
+
+    tolerance is a fractional allowance (0.0 = exact). expected=None means the
+    server count was unavailable, which is reported (not silently passed).
+    """
+    if expected is None:
+        return True, f"got {got}; expected count unavailable"
+    if expected == 0:
+        return got == 0, f"got {got}; expected 0"
+    delta = abs(got - expected) / expected
+    ok = delta <= tolerance
+    return ok, f"got {got} vs expected {expected} (delta {delta:.4f}, allow {tolerance})"
+
+
+def in_bbox(lon, lat, bbox: tuple = HARRIS_BBOX) -> bool:
+    """True if (lon, lat) is inside bbox and numeric."""
+    try:
+        lon_f, lat_f = float(lon), float(lat)
+    except (TypeError, ValueError):
+        return False
+    mnlon, mnlat, mxlon, mxlat = bbox
+    return mnlon <= lon_f <= mxlon and mnlat <= lat_f <= mxlat
+
+
+def validate_point(lon, lat, bbox: tuple = HARRIS_BBOX):
+    """Return ((lon, lat), None) if the point passes gross sanity, else
+    (None, reason). Rejects no-geometry, non-numeric, null-island, out-of-bbox.
+    """
+    if lon is None or lat is None:
+        return None, "no_geometry"
+    try:
+        lon_f, lat_f = float(lon), float(lat)
+    except (TypeError, ValueError):
+        return None, "non_numeric"
+    if lon_f == 0 and lat_f == 0:
+        return None, "null_island"
+    if not in_bbox(lon_f, lat_f, bbox):
+        return None, "out_of_bbox"
+    return (lon_f, lat_f), None
 
 
 def iter_features(
@@ -95,7 +206,9 @@ def iter_features(
     """Yield every feature dict ({'attributes': ..., 'geometry': ...}) from a layer."""
     session = _session()
     layer_url = layer_url.rstrip("/")
-    info = get_layer_info(layer_url, session)
+    # Resolve the endpoint first so a moved primary degrades to a fallback
+    # (e.g. the MapServer mirror) instead of aborting the pull.
+    layer_url, info = resolve_layer(layer_url, session=session)
 
     max_rc = int(info.get("maxRecordCount") or DEFAULT_PAGE_SIZE)
     page = min(page_size or max_rc, max_rc)
@@ -157,17 +270,28 @@ def iter_features(
 
 
 def point_of(feature: dict) -> tuple[Optional[float], Optional[float]]:
-    """Return (lon, lat) for a point geometry, or a rough centroid for polygons."""
+    """Return (lon, lat) for a point geometry, or a rough centroid for polygons.
+
+    Resilient to malformed geometry: any missing/non-numeric coordinate yields
+    (None, None) rather than raising, so one bad feature can't abort a pull.
+    """
     geom = feature.get("geometry")
-    if not geom:
+    if not isinstance(geom, dict):
         return None, None
-    if "x" in geom and "y" in geom:
-        return geom.get("x"), geom.get("y")
-    rings = geom.get("rings") or geom.get("paths")
-    if rings:
-        pts = [pt for ring in rings for pt in ring]
-        if pts:
-            xs = [p[0] for p in pts]
-            ys = [p[1] for p in pts]
-            return sum(xs) / len(xs), sum(ys) / len(ys)
+    try:
+        if "x" in geom and "y" in geom:
+            x, y = geom.get("x"), geom.get("y")
+            if x is None or y is None:
+                return None, None
+            return float(x), float(y)
+        rings = geom.get("rings") or geom.get("paths")
+        if rings:
+            pts = [pt for ring in rings for pt in ring
+                   if isinstance(pt, (list, tuple)) and len(pt) >= 2]
+            xs = [float(p[0]) for p in pts]
+            ys = [float(p[1]) for p in pts]
+            if xs and ys:
+                return sum(xs) / len(xs), sum(ys) / len(ys)
+    except (TypeError, ValueError):
+        return None, None
     return None, None

@@ -18,7 +18,7 @@ import json
 import logging
 import sys
 
-from scraper import arcgis, db, hcad_bulk, names
+from scraper import arcgis, db, hcad_bulk, names, validate
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
@@ -152,6 +152,28 @@ def cmd_stats(args):
         print(f"{table:<30} {count:>10} rows")
 
 
+def cmd_validate(args):
+    """Run validation gates against the loaded tables (P0 spine gate)."""
+    conn = db.connect(args.db)
+    reports = validate.validate_many(conn, validate.HARRIS_SPINE_SPECS)
+    if args.json_out:
+        with open(args.json_out, "w", encoding="utf-8") as fh:
+            json.dump([r.to_dict() for r in reports], fh, indent=2)
+        print(f"wrote validation report to {args.json_out}")
+    for r in reports:
+        print(f"{r.table:<20} {r.status}")
+        for c in r.checks:
+            mark = {"ok": "  ok  ", "warn": " WARN ", "fail": " FAIL "}[c.status]
+            print(f"   [{mark}] {c.name}: {c.detail}")
+    overall = validate.overall_status(reports)
+    print(f"\noverall: {overall}")
+    # Non-zero exit on FAIL so nightly automation / CI can gate on it.
+    if overall == validate.FAIL:
+        sys.exit(2)
+    if overall == validate.PARTIAL:
+        sys.exit(1)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--db", default=db.DEFAULT_DB, help="SQLite database path")
@@ -207,6 +229,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     st = sub.add_parser("stats", help="row counts per table")
     st.set_defaults(func=cmd_stats)
+
+    v = sub.add_parser("validate", help="run validation gates against loaded tables")
+    v.add_argument("--json-out", default=None, help="write the validation report as JSON")
+    v.set_defaults(func=cmd_validate)
     return p
 
 

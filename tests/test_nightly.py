@@ -227,3 +227,98 @@ def test_structured_log_written(tmp_path):
     lines = [json.loads(l) for l in (tmp_path / "nightly.log").read_text().splitlines() if l.strip()]
     events = {l["event"] for l in lines}
     assert {"run_started", "stage_finished", "run_finished"} <= events
+
+
+# ---- identity-spine stage data + prior-run regression ---------------------
+
+def _spine_steps(metrics):
+    """Steps where identity_join reports the given spine metrics dict."""
+    return [
+        _ok_stage("preflight"),
+        _ok_stage("hcad_load", rows=100),
+        _ok_stage("gis_pull", rows=200),
+        nightly.Stage("identity_join", True, lambda ctx: nightly.StageOutcome(
+            validation_status="PASS", data={"spine_metrics": metrics})),
+        nightly.Stage("validation", True,
+                      lambda ctx: nightly.StageOutcome(validation_status="PASS")),
+        _publish_stage(),
+    ]
+
+
+def test_spine_metrics_recorded_in_manifest(tmp_path):
+    metrics = {"unique_parcels": 1000, "unique_accounts": 1000, "join_rate": 0.95}
+    nightly.run_nightly("harris", tmp_path, steps=_spine_steps(metrics))
+    suc = _read(tmp_path / "latest_success.json")
+    stage = next(s for s in suc["stages"] if s["name"] == "identity_join")
+    assert stage["data"]["spine_metrics"]["unique_parcels"] == 1000
+
+
+def test_prior_spine_metrics_passed_to_next_run(tmp_path):
+    # run 1 publishes a baseline
+    nightly.run_nightly("harris", tmp_path,
+                        steps=_spine_steps({"unique_parcels": 1000,
+                                            "unique_accounts": 1000, "join_rate": 0.95}))
+    # run 2: a stage that asserts it received the prior baseline via ctx.params
+    seen = {}
+
+    def identity(ctx):
+        seen["prior"] = ctx.params.get("prior_spine")
+        return nightly.StageOutcome(validation_status="PASS",
+                                    data={"spine_metrics": {"unique_parcels": 1000}})
+
+    steps = [
+        _ok_stage("preflight"),
+        nightly.Stage("identity_join", True, identity),
+        nightly.Stage("validation", True,
+                      lambda ctx: nightly.StageOutcome(validation_status="PASS")),
+        _publish_stage(),
+    ]
+    nightly.run_nightly("harris", tmp_path, steps=steps)
+    assert seen["prior"] is not None
+    assert seen["prior"]["unique_accounts"] == 1000
+
+
+def test_real_spine_stage_fails_on_regression(tmp_path):
+    # Build a DB and use the REAL identity stage to prove regression -> FAIL,
+    # no publish, and prior success preserved.
+    import sqlite3
+    from scraper import db as dbmod
+
+    db_path = tmp_path / "spine.db"
+    conn = dbmod.connect(str(db_path))
+    conn.execute('CREATE TABLE parcels (hcad_num TEXT, site_addr_1 TEXT)')
+    conn.execute('CREATE TABLE owners (acct TEXT, mailto TEXT, mail_addr_1 TEXT)')
+    conn.executemany('INSERT INTO parcels VALUES (?,?)', [(str(i), "ADDR") for i in range(100)])
+    conn.executemany('INSERT INTO owners VALUES (?,?,?)',
+                     [(str(i), "OWNER", "MAIL") for i in range(100)])
+    conn.commit()
+    conn.close()
+
+    real_steps = [
+        _ok_stage("preflight"),
+        nightly.Stage("identity_join", True, nightly._stage_identity),
+        nightly.Stage("validation", True,
+                      lambda ctx: nightly.StageOutcome(validation_status="PASS")),
+        _publish_stage(),
+    ]
+    # run 1: baseline (100 accounts), publishes
+    code1 = nightly.run_nightly("harris", tmp_path, db_path=db_path, steps=real_steps)
+    assert code1 == nightly.EXIT_PASS
+    good = _read(tmp_path / "latest_success.json")
+
+    # simulate a truncated owner file: drop owners to 10 accounts
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("DELETE FROM owners WHERE CAST(acct AS INTEGER) >= 10")
+    conn.commit()
+    conn.close()
+
+    # run 2: real spine stage should detect the material regression -> FAIL
+    code2 = nightly.run_nightly("harris", tmp_path, db_path=db_path, steps=real_steps)
+    assert code2 == nightly.EXIT_FAIL
+    att = _read(tmp_path / "latest_attempt.json")
+    assert att["status"] == "FAIL"
+    assert att["published"] is False
+    # prior good success preserved
+    assert _read(tmp_path / "latest_success.json")["run_id"] == good["run_id"]
+    # a notification was emitted
+    assert (tmp_path / "notifications.log").exists()

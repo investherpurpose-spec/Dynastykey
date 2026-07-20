@@ -78,9 +78,15 @@ spine). No external dependencies. This is the milestone that proves the pipeline
     (`run_history`, `summarize_health`, `format_health`, consecutive-failure
     streak) surfaced via `nightly.py --status`. No external platform/framework.
     Wired into the runner. 10 tests.
-- [ ] **Identity-resolution spine check**
-  - Measure parcels↔owner join rate after load; expose it as a validation metric.
-  - *Acceptance:* join rate below threshold trips a validation warning.
+- [x] **Identity-resolution spine check** (`scraper/spine.py`) — **DONE**
+  - Measures unique parcels/accounts, duplicate-key counts/rates, matched/
+    unmatched parcels, parcel→owner join rate, owner-name/address/parcel-address
+    completeness, and GIS centroid validity (when geometry present). Compares
+    critical metrics against the prior successful run and **fails loud on a
+    material regression** (>10% drop); low join rate / elevated duplicates /
+    missing baseline → PARTIAL. Wired as the critical `identity_join` nightly
+    stage; metrics recorded in the manifest so each run compares to the last
+    success. 13 spine tests + 3 runner integration tests.
 
 ## P1 — Clerk Feed enablement (Phase 4 prep + build)
 

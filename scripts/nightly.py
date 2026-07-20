@@ -167,6 +167,9 @@ class StageOutcome:
     # validation stages report PASS/PARTIAL/FAIL; a FAIL on a critical stage
     # aborts the run just like an exception would.
     validation_status: Optional[str] = None
+    # structured data carried into the manifest (e.g. spine metrics for the
+    # next run to compare against).
+    data: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -186,12 +189,14 @@ class StageResult:
     warnings: list = field(default_factory=list)
     error: str = ""
     detail: str = ""
+    data: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
             "name": self.name, "critical": self.critical, "status": self.status,
             "duration_s": round(self.duration_s, 4), "rows": self.rows,
             "warnings": self.warnings, "error": self.error, "detail": self.detail,
+            "data": self.data,
         }
 
 
@@ -301,6 +306,20 @@ def _stage_gis(ctx: NightlyContext) -> StageOutcome:
     return StageOutcome(rows=total, detail=f"parcels layer -> {table}")
 
 
+def _stage_identity(ctx: NightlyContext) -> StageOutcome:
+    from scraper import spine
+    prior = ctx.params.get("prior_spine")
+    report = spine.check_spine(ctx.conn, prior_metrics=prior)
+    m = report.metrics
+    return StageOutcome(
+        rows=m.unique_parcels,
+        validation_status=report.status,
+        warnings=list(report.reasons) if report.status != "PASS" else [],
+        detail=f"join_rate={m.join_rate:.4f} matched={m.matched_parcels} "
+               f"unmatched={m.unmatched_parcels}",
+        data={"spine_metrics": m.to_dict()})
+
+
 def _stage_validation(ctx: NightlyContext) -> StageOutcome:
     from scraper import validate
     reports = validate.validate_many(ctx.conn, validate.HARRIS_SPINE_SPECS)
@@ -321,9 +340,21 @@ def default_steps() -> list:
         Stage("preflight", True, _stage_preflight),
         Stage("hcad_load", True, _stage_hcad),
         Stage("gis_pull", True, _stage_gis),
+        Stage("identity_join", True, _stage_identity),
         Stage("validation", True, _stage_validation),
         Stage("publish", True, _stage_publish),
     ]
+
+
+def _prior_spine_metrics(work_dir) -> Optional[dict]:
+    """Pull the spine metrics recorded by the last successful run, if any."""
+    suc = monitoring.latest_success(work_dir)
+    if not suc:
+        return None
+    for stage in suc.get("stages", []):
+        if stage.get("name") == "identity_join":
+            return (stage.get("data") or {}).get("spine_metrics")
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -358,7 +389,11 @@ def run_nightly(county_id: str, work_dir, *, db_path=None, exports_dir=None,
             run_id=run_id, county_id=county_id,
             code_version=code_ver or code_version(),
             started_at=start.isoformat())
-        ctx = NightlyContext(county_id, work_dir, db_path, exports_dir, params or {}, log)
+        run_params = dict(params or {})
+        # make the prior successful run's spine metrics available for regression
+        # comparison, unless the caller already supplied a baseline.
+        run_params.setdefault("prior_spine", _prior_spine_metrics(work_dir))
+        ctx = NightlyContext(county_id, work_dir, db_path, exports_dir, run_params, log)
         log("run_started", run_id=run_id, county=county_id,
             code_version=manifest.code_version)
 
@@ -374,7 +409,8 @@ def run_nightly(county_id: str, work_dir, *, db_path=None, exports_dir=None,
                 status = _classify(outcome)
                 sr = StageResult(stage.name, stage.critical, status,
                                  time.monotonic() - t0, rows=outcome.rows,
-                                 warnings=list(outcome.warnings), detail=outcome.detail)
+                                 warnings=list(outcome.warnings), detail=outcome.detail,
+                                 data=dict(outcome.data))
                 manifest.stages.append(sr)
                 log("stage_finished", run_id=run_id, stage=stage.name,
                     status=status, rows=outcome.rows, duration_s=round(sr.duration_s, 4))

@@ -263,3 +263,22 @@ Attach to the certification record:
 
 When all eight are recorded, P0 moves from LIVE VERIFIED to PRODUCTION CERTIFIED.
 Only then does Phase 2 (Clerk feed / Tax TPIA) begin.
+
+---
+
+## 8. Certification attempt log (verified facts only)
+
+- **2026-07-20 — BLOCKED, not attempted.** Live certification could not begin.
+  The build/execution environment's network policy denies outbound CONNECT to
+  all three required hosts (proxy gateway 403):
+  - `download.hcad.org:443` — connect_rejected (policy denial)
+  - `hcad.org:443` — connect_rejected (policy denial)
+  - `www.gis.hctx.net:443` — connect_rejected (policy denial)
+  A real `scripts/nightly.py` invocation (`--hcad-year 2026 --gis-limit 50
+  --geometry`) executed and FAILED loud at the `hcad_load` stage with a
+  transport error, `published=false`, no `latest_success` written, and a
+  `notifications.log` alert emitted — confirming fail-loud/no-silent-publish
+  behavior, but producing **no** live source evidence. Phases A–D remain
+  unexecuted. Current state: **NOT READY** (not yet LIVE VERIFIED).
+  Certification requires re-running this runbook from a host whose network
+  policy permits `hcad.org`, `download.hcad.org`, and `gis.hctx.net`.

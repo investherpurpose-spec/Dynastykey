@@ -16,6 +16,30 @@ Legend: `[ ]` todo · `[~]` in progress · `[x]` done
 
 ---
 
+## Standing constraint — evidence source of truth (2026-08-08)
+
+The verified evidence library is built by **manual validation on the operator's
+Windows machine**. That validation is the **authoritative source of truth** for
+verified cases. This constraint governs every item below and every future item:
+
+- **Do NOT generate synthetic/synthetic-proof evidence** as a substitute for
+  verified cases. Synthetic fixtures remain allowed *only* as finding-tests for
+  code behavior, never as entries in the verified library.
+- **Do NOT add new platform features or new scoring/selection layers.** Feature
+  growth is paused.
+- **Assume new verified cases arrive daily** via the validation/import workflow.
+- **Keep future work focused on *leveraging* the growing evidence set** —
+  ingesting it cleanly, and making existing systems read from it — **not on
+  replacing or expanding around it.**
+
+The immediate unblocked work item is the daily-reviewed-CSV → verified-library
+import path (below); it waits on the first real batches from the Windows
+validation workflow. Live source pulls (`hcad.org`, `download.hcad.org`,
+`gis.hctx.net`) remain network-blocked in this environment, so real data enters
+only through that operator workflow.
+
+---
+
 ## P0 — Production Spine (Phase 1) — datasets already under engineering control
 
 Goal: a stable, gated, monitored nightly run on Property + GIS (the identity

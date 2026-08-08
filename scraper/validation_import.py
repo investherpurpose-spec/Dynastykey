@@ -138,20 +138,49 @@ def _clean_candidates(candidates: Iterable) -> list[str]:
     return out
 
 
+def _sci_to_int(value: str) -> Optional[int]:
+    """The exact integer a scientific-notation cell denotes at its shown precision.
+
+    Pure integer arithmetic (no float): ``"1.00258E+12"`` -> ``1002580000000``.
+    """
+    m = _SCI_RE.match(value)
+    if not m:
+        return None
+    mant, exp = m.group(1), int(m.group(2))
+    frac = len(mant.split(".", 1)[1]) if "." in mant else 0
+    digits = int(mant.replace(".", ""))
+    scale = exp - frac
+    return digits * (10 ** scale) if scale >= 0 else digits // (10 ** (-scale))
+
+
+def _round_to_sigfigs(n: int, sigfigs: int) -> int:
+    """Round a non-negative integer to *sigfigs* significant figures, half-up,
+    in pure integer arithmetic (matches how Excel displays the value)."""
+    if n == 0 or sigfigs <= 0:
+        return 0
+    ndigits = len(str(n))
+    if ndigits <= sigfigs:
+        return n
+    step = 10 ** (ndigits - sigfigs)
+    return (n + step // 2) // step * step
+
+
 def consistent_candidates(sci_value: str, candidates: Iterable) -> list[str]:
     """Return the canonical candidates consistent with a scientific-notation value.
 
-    A candidate ``c`` is consistent when ``int(c)``, formatted to the same number
-    of significant figures the value shows, reproduces the value exactly.
+    A candidate is consistent when its account, rounded to the same number of
+    significant figures the corrupted cell shows, reproduces exactly the integer
+    that cell denotes. Everything stays in the integer/text domain — the account
+    itself is only ever handled as canonical text; the integer form is a transient
+    comparison, never a stored or returned value.
     """
-    sig_target = _sci_signature(sci_value)
-    if sig_target is None:
+    displayed = _sci_to_int(sci_value)
+    sigfigs = _sci_sigfigs(sci_value)
+    if displayed is None or not sigfigs:
         return []
-    sigfigs = len(sig_target[0])
     out: list[str] = []
     for canon in _clean_candidates(candidates):
-        formatted = f"{int(canon):.{sigfigs - 1}E}"  # e.g. "1.00258E+12"
-        if _sci_signature(formatted) == sig_target:
+        if _round_to_sigfigs(int(canon), sigfigs) == displayed:
             out.append(canon)
     return out
 

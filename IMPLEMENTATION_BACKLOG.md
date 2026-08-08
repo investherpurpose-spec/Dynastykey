@@ -38,6 +38,26 @@ validation workflow. Live source pulls (`hcad.org`, `download.hcad.org`,
 `gis.hctx.net`) remain network-blocked in this environment, so real data enters
 only through that operator workflow.
 
+### Import boundary — Excel scientific-notation account recovery `[~]`
+
+`scraper/validation_import.py` (+ `tests/test_validation_import.py`) defends the
+operator import seam against Excel mangling 13-digit HCAD accounts into
+scientific notation (`1002580000022` → `1.00258E+12`). Deterministic, refuse-to-
+guess recovery: a sci value is never treated as canonical; it is recovered only
+when **exactly one** clean candidate account is consistent with it; leading zeros
+preserved; already-canonical values passed through unchanged; the reviewed CSV is
+read **read-only** (reviewer decisions/notes never mutated). Ambiguous rows (0 or
+≥2 consistent candidates) are held for manual account confirmation. This lives
+strictly at the boundary — no resolver/legal-matcher/scorer/Aurora change.
+
+**Open for production wiring (needs operator confirmation):**
+- the real `validation_sample.csv` column names (account + legal-key columns);
+- the candidate source — the recovery needs an *uncorrupted* candidate set, so
+  the module takes an injected `legal_lookup(subdivision, lot, block)`; a real
+  legal index (or the resolver's live candidate output) must be wired in, since
+  no legal index exists in-repo yet and the review rows currently carry only a
+  name-match `candidate_acct` (which is itself Excel-corrupted in the CSV).
+
 ---
 
 ## P0 — Production Spine (Phase 1) — datasets already under engineering control
